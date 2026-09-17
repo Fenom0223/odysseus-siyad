@@ -18,6 +18,8 @@ IDENTIDAD
 CONTRATO DE TAREA (lo que el bot postea en la sala)
     Un mensaje de texto con el prefijo NP_TASK: seguido de un JSON:
         NP_TASK:{"task_id":"t-001","from":"@juan:dominio","text":"...","locale":"es"}
+    Si la sala es E2EE, el evento llega cifrado (megolm) y nio lo descifra
+    antes de disparar el callback.
 
 INTEGRACION (dos caminos, elegir uno)
     A) HTTP (cero acople): exportar NP_OFFICE_TASK_URL apuntando a una ruta de
@@ -33,28 +35,33 @@ USO
     python np_office_listener.py               # corre el listener (HTTP o echo)
 
 VARIABLES DE ENTORNO (las escribe onboard.sh en el docker.env del usuario)
-    NP_MX_HOMESERVER        https://np-cpu-<cliente>.<dominio>
-    NP_MX_DESKTOP_MXID      @desktop-<usuario>:<dominio>
-    NP_MX_DESKTOP_TOKEN     token de sesion ya emitido (preferido)
-    NP_MX_DESKTOP_PASSWORD  fallback si no hay token
-    NP_MX_OFFICE_ROOM_ID    !abc123:dominio      (preferido)
-    NP_MX_OFFICE_ALIAS      #mi-oficina-<usuario>:<dominio>
-    NP_MX_BOT_MXID          @np-bot:<dominio>    (unico remitente confiable)
-    NP_OFFICE_TASK_URL      (opcional) endpoint HTTP del ejecutor de tu app
-    NP_OFFICE_STATE_DIR     (opcional) store de nio. default: ./.np_office
-    NP_OFFICE_SYNC_TIMEOUT  (opcional) ms de long-poll. default: 30000
-    NP_MX_TRUSTED_SENDERS   (opcional) CSV de remitentes extra confiables
+    NP_MX_HOMESERVER          https://np-cpu-<cliente>.<dominio>
+    NP_MX_DESKTOP_MXID        @desktop-<usuario>:<dominio>
+    NP_MX_DESKTOP_TOKEN       token de sesion ya emitido (preferido)
+    NP_MX_DESKTOP_PASSWORD    fallback si no hay token
+    NP_MX_DESKTOP_DEVICE_ID   device_id FIJO (default: NPOFFICEDESKTOP)
+    NP_MX_OFFICE_ROOM_ID      !abc123:dominio      (preferido)
+    NP_MX_OFFICE_ALIAS        #mi-oficina-<usuario>:<dominio>
+    NP_MX_BOT_MXID            @np-bot:<dominio>    (unico remitente confiable)
+    NP_OFFICE_TASK_URL        (opcional) endpoint HTTP del ejecutor de tu app
+    NP_OFFICE_STATE_DIR       (opcional) store de nio/E2EE. default: ./.np_office
+    NP_OFFICE_SYNC_TIMEOUT    (opcional) ms de long-poll. default: 30000
+    NP_MX_TRUSTED_SENDERS     (opcional) CSV de remitentes extra confiables
+    NP_OFFICE_ENCRYPTED       (opcional) 1 = exigir E2EE (falla si falta olm)
 
-NOTA E2EE: esta version usa sala sin cifrado (invite-only en tu propio
-Synapse). Para cifrado en reposo/transito extremo a extremo, agregar
-matrix-nio[e2e] + `store_path` con persistencia y crear la sala con
-m.room.encryption; ver README.md de este directorio.
+E2EE
+    Requiere matrix-nio[e2e] (libolm). El device_id DEBE ser fijo y el store
+    (NP_OFFICE_STATE_DIR) persistente: la cuenta Olm vive ahi. Si el device_id
+    cambia entre arranques, el listener no puede descifrar la sala.
+    Los archivos se suben cifrados (upload(..., encrypt=True)) y viajan como
+    "file" con las claves, igual que hace el bot.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import os
 import signal
@@ -62,14 +69,16 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 try:
     from nio import (
         AsyncClient,
         AsyncClientConfig,
         LoginResponse,
+        MegolmEvent,
         RoomMessageText,
+        UploadResponse,
     )
 except ImportError:  # pragma: no cover
     print("[OFFICE] FATAL: falta matrix-nio. Instalar: pip install 'matrix-nio[e2e]'",
@@ -78,6 +87,7 @@ except ImportError:  # pragma: no cover
 
 TASK_MARKER = "NP_TASK:"
 LOG_PREFIX = "[OFFICE]"
+DEFAULT_DEVICE_ID = "NPOFFICEDESKTOP"
 
 Handler = Callable[["Task"], Any]
 
@@ -109,18 +119,24 @@ class ConfigError(RuntimeError):
     pass
 
 
+def _truthy(value: str) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class OfficeConfig:
     homeserver: str
     mxid: str
     token: str
     password: str
+    device_id: str
     room_id: str
     room_alias: str
     bot_mxid: str
     task_url: str
     state_dir: str
     trusted: Tuple[str, ...]
+    encrypted: bool = False
     sync_timeout: int = 30000
     backoff_start: float = 2.0
     backoff_max: float = 60.0
@@ -136,11 +152,13 @@ class OfficeConfig:
         mxid = _get("NP_MX_DESKTOP_MXID")
         token = _get("NP_MX_DESKTOP_TOKEN")
         password = _get("NP_MX_DESKTOP_PASSWORD")
+        device_id = _get("NP_MX_DESKTOP_DEVICE_ID", DEFAULT_DEVICE_ID) or DEFAULT_DEVICE_ID
         room_id = _get("NP_MX_OFFICE_ROOM_ID")
         room_alias = _get("NP_MX_OFFICE_ALIAS").strip('"')
         bot_mxid = _get("NP_MX_BOT_MXID")
         task_url = _get("NP_OFFICE_TASK_URL")
         state_dir = _get("NP_OFFICE_STATE_DIR", "./.np_office") or "./.np_office"
+        encrypted = _truthy(_get("NP_OFFICE_ENCRYPTED"))
         extra = [s.strip() for s in _get("NP_MX_TRUSTED_SENDERS").split(",") if s.strip()]
         trusted = tuple(dict.fromkeys([x for x in ([bot_mxid] + extra) if x]))
 
@@ -168,12 +186,14 @@ class OfficeConfig:
             mxid=mxid,
             token=token,
             password=password,
+            device_id=device_id,
             room_id=room_id,
             room_alias=room_alias,
             bot_mxid=bot_mxid,
             task_url=task_url,
             state_dir=state_dir,
             trusted=trusted,
+            encrypted=encrypted,
             sync_timeout=sync_timeout,
         )
 
@@ -240,26 +260,82 @@ class OfficeListener:
         cfg = self.config
         store = Path(cfg.state_dir)
         store.mkdir(parents=True, exist_ok=True)
+
+        # device_id estable en disco: sin esto, cada arranque crea un device
+        # nuevo mientras el store conserva la Olm del anterior -> E2EE mudo.
+        dev_file = store / "device_id.txt"
+        if dev_file.is_file():
+            stored = dev_file.read_text().strip()
+            if stored:
+                cfg.device_id = stored
+        else:
+            dev_file.write_text(cfg.device_id)
+
         client = AsyncClient(
             cfg.homeserver,
             cfg.mxid,
+            device_id=cfg.device_id,
             store_path=str(store),
-            config=AsyncClientConfig(store_sync_tokens=True),
+            config=AsyncClientConfig(
+                store_sync_tokens=True,
+                encryption_enabled=True,
+            ),
         )
         client.add_event_callback(self._on_message, RoomMessageText)
+        client.add_event_callback(self._on_decryption_failure, MegolmEvent)
 
         if cfg.token:
-            client.access_token = cfg.token
-            client.user_id = cfg.mxid
-            client.device_id = client.device_id or "SIYAD_OFFICE"
-            log("LOGIN_TOKEN", mxid=cfg.mxid)
+            client.restore_login(cfg.mxid, cfg.device_id, cfg.token)
+            log("LOGIN_TOKEN", mxid=cfg.mxid, device_id=cfg.device_id)
         else:
-            resp = await client.login(cfg.password, device_name="SIYAD Office Desktop")
+            resp = await client.login(
+                cfg.password, device_name="SIYAD Office Desktop",
+                device_id=cfg.device_id,
+            )
             if not isinstance(resp, LoginResponse):
                 raise RuntimeError(f"login fallo: {resp}")
-            log("LOGIN_PASSWORD", mxid=cfg.mxid, device=getattr(resp, "device_id", "?"))
+            log("LOGIN_PASSWORD", mxid=cfg.mxid,
+                device=getattr(resp, "device_id", "?"))
 
         self.client = client
+        await self._setup_e2ee()
+
+    async def _setup_e2ee(self) -> None:
+        """Gestión de claves Olm/Megolm (mismo orden que el bot NP)."""
+        cfg = self.config
+        client = self.client
+        if client is None:
+            return
+
+        if getattr(client, "olm", None) is None:
+            if cfg.encrypted:
+                log("E2EE_OLM_MISSING",
+                    device_id=cfg.device_id, store_path=cfg.state_dir,
+                    hint="instalar matrix-nio[e2e] y verificar device_id.txt")
+                raise RuntimeError(
+                    "E2EE requerido (NP_OFFICE_ENCRYPTED=1) pero la máquina Olm "
+                    "no cargó: instalar 'matrix-nio[e2e]' y revisar el store."
+                )
+            log("E2EE_DISABLED", reason="olm_ausente", encrypted=False)
+            return
+
+        log("E2EE_OLM_READY", device_id=cfg.device_id, store_path=cfg.state_dir)
+        try:
+            if client.should_upload_keys:
+                await client.keys_upload()
+                log("E2EE_KEYS_UPLOAD_OK", device_id=cfg.device_id)
+            else:
+                log("E2EE_KEYS_ALREADY_PUBLISHED", device_id=cfg.device_id)
+            if client.should_query_keys:
+                await client.keys_query()
+                log("E2EE_KEYS_QUERY_OK", reason="startup")
+        except Exception as exc:
+            log("E2EE_KEY_MGMT_FAIL", exc_type=type(exc).__name__, exc=str(exc)[:200])
+
+    async def _on_decryption_failure(self, room: Any, event: Any) -> None:
+        log("DECRYPTION_FAIL", room_id=getattr(event, "room_id", "?"),
+            event_id=getattr(event, "event_id", "?"),
+            sender=getattr(event, "sender", "?"))
 
     async def _resolve_room(self) -> str:
         if self._room_id:
@@ -335,6 +411,7 @@ class OfficeListener:
         room_id = await self._resolve_room()
         text = (result.text or "").strip() or "Tarea completada."
 
+        # Texto: nio cifra solo si la sala es E2EE (m.room.encrypted).
         await self.client.room_send(
             room_id,
             "m.room.message",
@@ -348,25 +425,42 @@ class OfficeListener:
                 log("FILE_MISSING", path=str(path))
                 continue
             data = path.read_bytes()
-            upload = await self.client.upload(
-                data, content_type="application/octet-stream", filename=path.name
-            )
-            content_uri = getattr(upload, "content_uri", None)
-            if not content_uri:
-                log("UPLOAD_FAIL", name=path.name)
+            # En sala cifrada el content NO lleva "url": lleva "file" con las
+            # claves de descifrado (patrón idéntico a _send_media del bot).
+            room_obj = self.client.rooms.get(room_id)
+            encrypt = bool(getattr(room_obj, "encrypted", False))
+            try:
+                resp, keys = await self.client.upload(
+                    io.BytesIO(data),
+                    content_type="application/octet-stream",
+                    filename=path.name,
+                    encrypt=encrypt,
+                    filesize=len(data),
+                )
+            except Exception as exc:
+                log("UPLOAD_FAIL", name=path.name, exc_type=type(exc).__name__,
+                    exc=str(exc)[:200])
                 continue
+            if not isinstance(resp, UploadResponse):
+                log("UPLOAD_FAIL", name=path.name, detail=str(resp)[:200])
+                continue
+
+            content = {
+                "msgtype": "m.file",
+                "body": path.name,
+                "info": {"size": len(data), "mimetype": "application/octet-stream"},
+            }
+            if encrypt and keys:
+                keys["url"] = resp.content_uri
+                content["file"] = keys
+            else:
+                content["url"] = resp.content_uri
+
             await self.client.room_send(
-                room_id,
-                "m.room.message",
-                {
-                    "msgtype": "m.file",
-                    "body": path.name,
-                    "url": content_uri,
-                    "info": {"size": len(data), "mimetype": "application/octet-stream"},
-                },
+                room_id, "m.room.message", content,
                 ignore_unverified_devices=True,
             )
-            log("FILE_SENT", name=path.name, bytes=len(data))
+            log("FILE_SENT", name=path.name, bytes=len(data), encrypted=encrypt)
 
     # --------------------------------------------------------------- ciclo vida
     async def run_forever(self) -> None:
@@ -374,6 +468,7 @@ class OfficeListener:
         executor = "handler" if self.handler else ("http" if cfg.task_url else "none")
         log("BOOT", mxid=cfg.mxid, homeserver=cfg.homeserver,
             room=(cfg.room_id or cfg.room_alias), executor=executor,
+            device_id=cfg.device_id, e2ee=cfg.encrypted,
             trusted=",".join(cfg.trusted))
 
         backoff = cfg.backoff_start
@@ -415,7 +510,9 @@ def selfcheck(config: OfficeConfig) -> int:
     print(f"  homeserver : {config.homeserver}")
     print(f"  mxid       : {config.mxid}")
     print(f"  auth       : {'token' if config.token else 'password'}")
+    print(f"  device_id  : {config.device_id}")
     print(f"  room       : {config.room_id or config.room_alias}")
+    print(f"  e2ee       : {'requerido' if config.encrypted else 'opcional/no exigido'}")
     print(f"  confiables : {', '.join(config.trusted)}")
     print(f"  ejecutor   : {config.task_url or 'handler Python (solo via API)'}")
     print(f"  state_dir  : {config.state_dir}")

@@ -138,8 +138,12 @@ Log esperado:
   ruteo lo garantiza Synapse, no el código.
 - **DOE es estándar**: las directivas `.md` (GEMINI.md) y Playwright como MCP
   viajan en la **imagen base** (código compartido), nunca en el `docker.env`.
-- **E2EE**: la sala se crea sin cifrado (invite-only en el Synapse propio). Para
-  activarlo: `m.room.encryption` + `matrix-nio[e2e]` con `store_path`
-  persistente (`NP_OFFICE_STATE_DIR` ya reservado).
+- **E2EE (por defecto ON)**: `onboard.sh` crea la sala con `m.room.encryption`
+  (megolm) y el listener exige E2EE (`NP_OFFICE_ENCRYPTED=1`). Requiere
+  `matrix-nio[e2e]` (libolm) y el **device_id FIJO** de
+  `NP_MX_DESKTOP_DEVICE_ID`: la cuenta Olm vive en `NP_OFFICE_STATE_DIR`, así que
+  si el device_id cambia entre arranques el listener no descifra. Los archivos
+  se suben cifrados (`upload(..., encrypt=True)`). Para sala en claro (debug):
+  `NP_OFFICE_E2EE=0 ./onboard.sh <cliente>.env <usuarios>.csv`
 - **Idempotencia**: eventos ya procesados descartados (últimos 500); se rechaza
   cualquier remitente distinto de `NP_MX_BOT_MXID`.
