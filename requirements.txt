@@ -47,3 +47,10 @@ pytest-asyncio
 # TestClient import when only classic httpx is present. Runtime code keeps
 # using `httpx` above; this is test-client only.
 httpx2
+# Pocket-to-Office listener (np_office/np_office_listener.py). Necesita el
+# extra e2e (python-olm/libolm) para descifrar la sala "Mi Oficina" (megolm)
+# y subir archivos cifrados. B33/B34/B35 — requerido por NP_OFFICE_ENCRYPTED=1.
+# Pin <0.26: 0.26 migra el extra e2e de python-olm a vodozemac y rompe la
+# superficie de API validada en vivo (Parte 8). En py>=3.14 python-olm se
+# compila desde sdist: requiere libolm-dev (ya agregado al Dockerfile).
+matrix-nio[e2e]>=0.25.2,<0.26

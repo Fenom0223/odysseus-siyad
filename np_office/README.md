@@ -91,20 +91,23 @@ mismo ciclo de vida que la app.
 
 ### Docker (sidecar)
 
-```yaml
-services:
-  odysseus:
-    # ...igual que hoy...
-    env_file: ./docker.env
+Ya está aplicado en `docker-compose.yml` (servicio `np_office_listener`),
+reusando la imagen de Odysseus (que ya trae `np_office/` + `matrix-nio[e2e]` +
+`libolm-dev`). El store Olm vive bajo `/app/data/np_office` para que el
+entrypoint lo chown-ee a PUID:PGID:
 
+```yaml
   np_office_listener:
-    image: <misma imagen de odysseus>
+    build: .
     command: ["python", "np_office/np_office_listener.py"]
     env_file: ./docker.env
+    environment:
+      - NP_OFFICE_TASK_URL=http://odysseus:7000/office/task
+      - NP_OFFICE_STATE_DIR=/app/data/np_office
     volumes:
       - ${APP_DATA_DIR:-./data}:/app/data:z
     depends_on: [odysseus]
-    restart: always
+    restart: unless-stopped
 ```
 
 ### Local (dev)

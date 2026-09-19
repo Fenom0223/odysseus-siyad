@@ -288,9 +288,11 @@ class OfficeListener:
             client.restore_login(cfg.mxid, cfg.device_id, cfg.token)
             log("LOGIN_TOKEN", mxid=cfg.mxid, device_id=cfg.device_id)
         else:
+            # nio 0.25.x: login() NO acepta device_id (la firma es
+            # password/device_name/token). El device_id FIJO va en el
+            # constructor de AsyncClient (arriba) y nio lo reusa en Api.login.
             resp = await client.login(
                 cfg.password, device_name="SIYAD Office Desktop",
-                device_id=cfg.device_id,
             )
             if not isinstance(resp, LoginResponse):
                 raise RuntimeError(f"login fallo: {resp}")
