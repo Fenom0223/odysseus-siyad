@@ -180,6 +180,7 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     "/api/upload",          # large files
     "/api/image",           # diffusion proxies (inpaint/harmonize/upscale/etc.) — own 120s httpx timeout
     "/api/memory/audit",    # retains own 120s LLM inactivity timeout
+    "/office",              # Pocket-to-Office (sidecar listener; research multi-minute)
 )
 
 
@@ -223,7 +224,7 @@ if AUTH_ENABLED:
         "/api/version",
         "/login",
     }
-    AUTH_EXEMPT_PREFIXES = ["/static"]
+    AUTH_EXEMPT_PREFIXES = ["/static", "/office"]
     # Dynamic paths whose own handler proves identity via a path-embedded
     # secret instead of the session/bearer auth. The route handler at
     # routes/task_routes.py validates the per-task `webhook_token` itself
@@ -623,6 +624,10 @@ app.include_router(setup_chat_routes(
 # Research (background deep-research tasks)
 from routes.research_routes import setup_research_routes
 app.include_router(setup_research_routes(research_handler, session_manager=session_manager))
+
+# Pocket-to-Office executor (sidecar np_office_listener -> POST /office/task)
+from routes.office_routes import setup_office_routes
+app.include_router(setup_office_routes(research_handler, session_manager=session_manager))
 
 # History
 from routes.history_routes import setup_history_routes

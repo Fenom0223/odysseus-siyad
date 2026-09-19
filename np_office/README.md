@@ -38,6 +38,13 @@ mismo archivo sirve para el contenedor de la app y para el listener.
 
 ### Camino A — HTTP contra el orquestador (recomendado: cero acople)
 
+> **Implementado:** `routes/office_routes.py` expone `POST /office/task` y ejecuta
+> el pipeline real de Odysseus (`research_handler.call_research_service`) resolviendo
+> el endpoint/modelo configurado. Se registra en `app.py` junto a research; el path
+> `/office` está exento del timeout duro (45s) y del `AuthMiddleware` porque el
+> listener corre en otro contenedor (no loopback). Los `files` se escriben bajo
+> `/app/data/office_reports` (mismo volumen que monta el sidecar).
+
 Odysseus expone FastAPI en el puerto **7000** (`APP_PORT`). Agregar una ruta
 (p. ej. junto a las de `routes/`):
 
