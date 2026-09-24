@@ -389,7 +389,7 @@ class OfficeListener:
         asi que se llama una vez por room_id y se reintenta en cada ciclo de
         sync hasta lograrlo.
         """
-        room_id = self.config.room_id
+        room_id = self._room_id or self.config.room_id
         if not room_id or room_id in self._joined:
             return
         try:
