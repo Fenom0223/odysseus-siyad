@@ -91,18 +91,23 @@ services:
   # Credenciales NP_MX_* generadas por onboard.sh (repo np-sovereign-core) y
   # volcadas en ./docker.env. matrix-nio[e2e] ya viene en la imagen
   # (requirements.txt) y libolm-dev en el Dockerfile.
-  # E2EE: device_id FIJO (NPOFFICEDESKTOP) + store Olm persistente. El store
-  # vive bajo /app/data para que el entrypoint lo chown-ee a PUID:PGID; un
-  # bind directo a /app/.np_office quedaria root-owned y el listener (no-root)
-  # no podria crear la cuenta Olm.
+  # E2EE: device_id FIJO (NPOFFICE-ODYSSEUS-<NODO>) + store Olm persistente.
+  # El store lo fija el env por instancia (NP_OFFICE_STATE_DIR): NO poner un
+  # override en environment, pisaria la ruta por instancia. El store vive bajo
+  # /app/data para que el entrypoint lo chown-ee a PUID:PGID; un bind directo a
+  # /app/.np_office quedaria root-owned y el listener (no-root) no podria
+  # crear la cuenta Olm.
   np_office_listener:
     build: .
     command: ["python", "np_office/np_office_listener.py"]
     env_file:
-      - ./docker.env
+      # Credenciales por instancia (empleado x app x nodo): las genera
+      # onboard.sh (np-sovereign-core) en <usuario>.odysseus.env. Apuntar con:
+      #   NP_OFFICE_ENV_FILE=./maria.odysseus.env docker compose up -d np_office_listener
+      # (fallback: ./docker.env, modelo legacy compartido).
+      - ${NP_OFFICE_ENV_FILE:-./docker.env}
     environment:
       - NP_OFFICE_TASK_URL=http://odysseus:7000/office/task
-      - NP_OFFICE_STATE_DIR=/app/data/np_office
     volumes:
       - ${APP_DATA_DIR:-./data}:/app/data:z
     depends_on:

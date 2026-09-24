@@ -20,16 +20,26 @@ Element X (móvil) ← resultado + m.file (informe PDF/CSV) ←────┘
 
 ## 2. Credenciales
 
-Las genera `onboard.sh` (repo `np-sovereign-core`) en el `docker.env` del usuario:
+Las genera `onboard.sh` (repo `np-sovereign-core`) en `<usuario>.odysseus.env`
+(un archivo por empleado × app × nodo; sin password: solo token). Se inyecta
+al listener con `NP_OFFICE_ENV_FILE=./maria.odysseus.env docker compose ...`
+(fallback legacy: `./docker.env`). Ya no hay que tocar nada a mano:
 
 ```ini
 NP_MX_HOMESERVER=https://np-cpu-<cliente>.<dominio>
 NP_MX_DESKTOP_MXID=@desktop-<usuario>:<dominio>
 NP_MX_DESKTOP_TOKEN=<token>
+NP_MX_DESKTOP_DEVICE_ID=NPOFFICE-ODYSSEUS-<nodo>
+NP_MX_DEVICE_NAME=SIYAD Office · odysseus · <nodo>
 NP_MX_OFFICE_ROOM_ID=!abc123:<dominio>
-NP_MX_OFFICE_ALIAS="#mi-oficina-<usuario>:<dominio>"
+NP_MX_OFFICE_ALIAS="#mi-oficina-<usuario>-odysseus-<nodo>:<dominio>"
 NP_MX_BOT_MXID=@np-bot:<dominio>
+NP_OFFICE_STATE_DIR=/app/data/np_office/<usuario>/<nodo>/odysseus
 ```
+
+El listener hace `room_join` automático al arrancar (idempotente): si la sala
+fue creada por el empleado y `@desktop-<usuario>` quedó solo invitado, se une
+solo en el primer sync.
 
 Odysseus ya usa `docker-compose.yml` con `environment:`/`--env-file`, así que el
 mismo archivo sirve para el contenedor de la app y para el listener.
