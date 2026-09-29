@@ -384,7 +384,9 @@ class OfficeListener:
         Cuando onboard.sh crea la sala con el token del EMPLEADO, la cuenta
         @desktop-<usuario> queda solo INVITADA (npo_provision_instance invita
         a bot + desktop). Sin este join el listener queda "mudo": los eventos
-        de la timeline no llegan a una cuenta solo invitada. room_join es
+        de la timeline no llegan a una cuenta solo invitada. join() de
+        matrix-nio (NO room_join: ese metodo NO existe y tiraba
+        AttributeError -> ROOM_JOIN_FAIL en bucle -> listener mudo) es
         idempotente en Synapse (si ya es miembro devuelve 200 con el room_id),
         asi que se llama una vez por room_id y se reintenta en cada ciclo de
         sync hasta lograrlo.
@@ -393,7 +395,7 @@ class OfficeListener:
         if not room_id or room_id in self._joined:
             return
         try:
-            resp = await self.client.room_join(room_id)
+            resp = await self.client.join(room_id)
             joined = getattr(resp, "room_id", None)
             if joined:
                 self._joined.add(joined)

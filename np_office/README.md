@@ -37,7 +37,7 @@ NP_MX_BOT_MXID=@np-bot:<dominio>
 NP_OFFICE_STATE_DIR=/app/data/np_office/<usuario>/<nodo>/odysseus
 ```
 
-El listener hace `room_join` automático al arrancar (idempotente): si la sala
+El listener hace `join()` automático al arrancar (idempotente): si la sala
 fue creada por el empleado y `@desktop-<usuario>` quedó solo invitado, se une
 solo en el primer sync.
 
