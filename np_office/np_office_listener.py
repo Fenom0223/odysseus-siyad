@@ -210,6 +210,11 @@ class OfficeConfig:
 class OfficeListener:
     """Listener Matrix de la app desktop: recibe tareas del bot y devuelve resultados."""
 
+    # Refresco proactivo de device lists (NIO-KEYSYNC-01): cada N
+    # segundos se piden los miembros de la sala y se fuerza un
+    # keys_query con todos sus devices.
+    DEVICE_REFRESH_SECS = 300
+
     def __init__(self, handler: Optional[Handler] = None,
                  config: Optional[OfficeConfig] = None) -> None:
         self.config = config or OfficeConfig.from_env()
@@ -220,6 +225,7 @@ class OfficeListener:
         self._joined: set = set()
         self._seen_order: list = []
         self._stop = asyncio.Event()
+        self._device_refreshed_at: float = 0.0
 
     # ---------------------------------------------------------------- ejecutor
     async def _dispatch(self, task: Task) -> TaskResult:
@@ -453,6 +459,17 @@ class OfficeListener:
         room_id = await self._resolve_room()
         text = (result.text or "").strip() or "Tarea completada."
 
+        # Device list fresca justo antes de compartir la session megolm
+        # (NIO-KEYSYNC-01): cierra la carrera entre el sync que reporta un
+        # device nuevo y la respuesta, para que ese device reciba las claves.
+        if getattr(self.client, "should_query_keys", False):
+            try:
+                await self.client.keys_query()
+                log("E2EE_KEYS_QUERY_OK", reason="pre_reply")
+            except Exception as exc:
+                log("KEY_QUERY_FAIL", exc_type=type(exc).__name__,
+                    exc=str(exc)[:160])
+
         # Texto: nio cifra solo si la sala es E2EE (m.room.encrypted).
         await self.client.room_send(
             room_id,
@@ -504,6 +521,72 @@ class OfficeListener:
             )
             log("FILE_SENT", name=path.name, bytes=len(data), encrypted=encrypt)
 
+    async def _key_maintenance(self) -> None:
+        """Tareas de claves que AsyncClient.sync_forever() ejecuta y
+        AsyncClient.sync() NO (NIO-KEYSYNC-01).
+
+        sync() baja el sync y nada más: no consulta device lists nuevas,
+        no sube One-Time Keys ni manda los to-device encolados. Sin esto:
+
+        * Un device creado DESPUÉS del arranque (el QR de Element X del
+          empleado, un device nuevo del bot) sigue siendo desconocido y
+          share_group_session() no le reparte la session megolm: ese chat
+          se queda en "unable to decrypt" para siempre.
+        * Las OTKs no se renuevan; agotadas, nadie puede abrir sesión
+          Olm con nosotros y dejan de llegarnos tareas.
+        * Las key requests se quedan encoladas y no se piden las
+          sessions que faltan.
+        """
+        if self.client is None or self.client.olm is None:
+            return
+        try:
+            # Refresco proactivo de las device lists de la sala
+            # (NIO-KEYSYNC-01): `device_lists.changed` sólo notifica cambios
+            # posteriores al sync, así que un device creado mientras el
+            # listener estaba caído quedaría desconocido para siempre y no
+            # recibiría las claves de nuestras respuestas. Se fuerza el
+            # keys_query completo (nio devuelve todos los devices de esos
+            # usuarios) al arrancar y cada DEVICE_REFRESH_SECS.
+            now = time.time()
+            if now - self._device_refreshed_at >= self.DEVICE_REFRESH_SECS:
+                room_id = self._room_id or self.config.room_id
+                if room_id:
+                    # nio NO persiste los miembros de la sala y, con
+                    # store_sync_tokens=True, los sync con `since` no vuelven
+                    # a traer el state: room.users llega vacío y sin esa
+                    # lista no hay manera de saber a qué devices consultar.
+                    # joined_members() devuelve los miembros de la sala y
+                    # con ellos se fuerza un keys_query, que pide TODOS los
+                    # devices de esos usuarios. OJO: nio ignora esa
+                    # respuesta si la sala aún no está en client.rooms
+                    # (al arrancar sólo aparece cuando llega un evento), así
+                    # que la lista se lee de la respuesta, no de room.users.
+                    resp = await self.client.joined_members(room_id)
+                    users = {m.user_id
+                             for m in getattr(resp, "members", None) or []}
+                    if users:
+                        self.client.olm.add_changed_users(users)
+                    log("E2EE_DEVICE_REFRESH", room=room_id[:16],
+                        users=len(users))
+                    self._device_refreshed_at = now
+            if self.client.should_query_keys:
+                await self.client.keys_query()
+                log("E2EE_KEYS_QUERY_OK", reason="maintenance")
+            if self.client.should_upload_keys:
+                await self.client.keys_upload()
+            if self.client.should_claim_keys:
+                await self.client.keys_claim(
+                    self.client.get_users_for_key_claiming())
+            await self.client.send_to_device_messages()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # La ventana NO se consume: si algo falla (red, HS caída) se
+            # reintenta en el siguiente ciclo en lugar de esperar N segundos.
+            self._device_refreshed_at = 0.0
+            log("KEY_MAINT_FAIL", exc_type=type(exc).__name__,
+                exc=str(exc)[:200])
+
     # --------------------------------------------------------------- ciclo vida
     async def run_forever(self) -> None:
         cfg = self.config
@@ -521,6 +604,7 @@ class OfficeListener:
                 await self._resolve_room()
                 await self._ensure_joined()
                 await self.client.sync(timeout=cfg.sync_timeout)
+                await self._key_maintenance()
                 backoff = cfg.backoff_start
             except asyncio.CancelledError:
                 break
