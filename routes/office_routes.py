@@ -14,6 +14,7 @@ listener es un contenedor distinto (no loopback) y no manda credencial.
 """
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import List, Optional
@@ -22,6 +23,9 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+# SQL-NUMERIC-01: el agregado (conteo/suma/orden) lo calcula SQL, no el LLM.
+from routes.office_grounding import GROUNDING_RULE, sql_grounding
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -36,7 +40,24 @@ class OfficeTaskRequest(BaseModel):
 
 
 def _resolve_endpoint():
-    """Resolver endpoint/modelo como lo hacen las rutas de research."""
+    """Resolver endpoint/modelo como lo hacen las rutas de research.
+
+    FIX OFFICE-LLM-ENV-01 (30-sep-2026): contrato NP_OFFICE_LLM_URL/MODEL/KEY
+    con prioridad sobre los settings de la app (mismo contrato que Eigent).
+    Motivo: los settings guardaban una key vieja de LiteLLM → el executor
+    devolvía 401 y la tarea terminaba como "Model 'sovereign-assistant'
+    requires an API key" (_tasks_ que el listener registraba como TASK_DONE,
+    o sea un fallo silencioso en la sala).
+    """
+    env_url = (os.environ.get("NP_OFFICE_LLM_URL") or "").strip().rstrip("/")
+    env_model = (os.environ.get("NP_OFFICE_LLM_MODEL") or "").strip()
+    env_key = (os.environ.get("NP_OFFICE_LLM_KEY") or "").strip()
+    if env_url and env_model:
+        url = env_url if env_url.endswith("/chat/completions") else (
+            (env_url + "/v1" if not env_url.endswith("/v1") else env_url)
+            + "/chat/completions")
+        return url, env_model, ({"Authorization": f"Bearer {env_key}"} if env_key else {})
+
     try:
         from src.endpoint_resolver import resolve_endpoint
     except Exception as exc:  # noqa: BLE001
@@ -72,6 +93,15 @@ def setup_office_routes(research_handler, session_manager=None) -> APIRouter:
         if not text:
             return {"answer": "", "files": []}
 
+        # SQL-NUMERIC-01 (30-sep-2026): el agregado viaja YA CALCULADO desde
+        # SQL en el prompt; el research service sólo redacta. Evita el fallo
+        # del 29-sep (5 facturas = 56,700 cuando el ground truth es 4 =
+        # 53,900: contó INV-0810, que es CREDIT HOLD).
+        _grounding = sql_grounding(text)
+        if _grounding:
+            text = text + GROUNDING_RULE.format(grounding=_grounding)
+            logger.info("office: SQL_GROUNDING bytes=%s", len(_grounding))
+
         ep_url, ep_model, ep_headers = _resolve_endpoint()
         if not ep_url or not ep_model:
             return {
@@ -83,14 +113,29 @@ def setup_office_routes(research_handler, session_manager=None) -> APIRouter:
             }
 
         try:
-            answer = await research_handler.call_research_service(
-                text,
-                ep_url,
-                ep_model,
-                max_time=900,
-                llm_headers=ep_headers,
-                max_rounds=20,
-            )
+            if _grounding:
+                # ── SQL-NUMERIC-01 (respuesta directa para lo tabular) ──
+                # call_research_service dispara DEEP RESEARCH (max_rounds=20):
+                # se va a internet (invoice-generator.com, hyperbots…), tarda
+                # >5 min y puede mezclar cifras ajenas con las nuestras. Para
+                # una pregunta con agregado SQL la respuesta va directa al
+                # modelo con el bloque [GROUNDING SQL] — mismo camino que
+                # Eigent y que el executor RAG: rápido y determinista.
+                from src.llm_core import llm_call_async
+                answer = await llm_call_async(
+                    ep_url, ep_model,
+                    [{"role": "user", "content": text}],
+                    headers=ep_headers, timeout=180,
+                )
+            else:
+                answer = await research_handler.call_research_service(
+                    text,
+                    ep_url,
+                    ep_model,
+                    max_time=900,
+                    llm_headers=ep_headers,
+                    max_rounds=20,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.exception("office: research fallo")
             return {
