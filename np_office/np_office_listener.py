@@ -167,6 +167,9 @@ class OfficeConfig:
     trusted: Tuple[str, ...]
     device_name: str = DEFAULT_DEVICE_NAME
     encrypted: bool = False
+    # True si el env del deploy declaro NP_MX_DESKTOP_DEVICE_ID: es la senal
+    # de identidad propia del deploy (rota device => rota cuenta Olm).
+    device_id_from_env: bool = False
     sync_timeout: int = 30000
     backoff_start: float = 2.0
     backoff_max: float = 60.0
@@ -183,7 +186,8 @@ class OfficeConfig:
         mxid = _get("NP_MX_DESKTOP_MXID")
         token = _get("NP_MX_DESKTOP_TOKEN")
         password = _get("NP_MX_DESKTOP_PASSWORD")
-        device_id = _get("NP_MX_DESKTOP_DEVICE_ID", DEFAULT_DEVICE_ID) or DEFAULT_DEVICE_ID
+        device_id_env = _get("NP_MX_DESKTOP_DEVICE_ID")
+        device_id = device_id_env or DEFAULT_DEVICE_ID
         room_id = _get("NP_MX_OFFICE_ROOM_ID")
         room_alias = _get("NP_MX_OFFICE_ALIAS").strip('"')
         bot_mxid = _get("NP_MX_BOT_MXID")
@@ -220,6 +224,7 @@ class OfficeConfig:
             token=token,
             password=password,
             device_id=device_id,
+            device_id_from_env=bool(device_id_env),
             device_name=device_name,
             room_id=room_id,
             room_alias=room_alias,
@@ -240,6 +245,15 @@ class OfficeListener:
     # segundos se piden los miembros de la sala y se fuerza un
     # keys_query con todos sus devices.
     DEVICE_REFRESH_SECS = 300
+    # Salud de las One-Time Keys en el homeserver (E2EE-OTK-SELFHEAL-01).
+    # nio NO se entera de cuantas OTKs quedan EN EL SERVIDOR (su
+    # uploaded_key_count es lo que subio el, no lo que retiene el HS), asi que
+    # sin este sondeo periodico el listener se queda mudo para siempre en
+    # cuanto el HS llega a 0 y nadie puede abrir sesion Olm con el.
+    OTK_MIN = 25          # por debajo de esto se fuerza la re-subida
+    OTK_CHECK_SECS = 600  # sondeo cada 10 min
+    UPLOAD_RETRIES = 4    # reintentos si el HS rechaza por ids ya existentes
+    DRAIN_MAX = 300       # tope de OTKs huerfanas que se autorreclaman
 
     def __init__(self, handler: Optional[Handler] = None,
                  config: Optional[OfficeConfig] = None) -> None:
@@ -254,6 +268,11 @@ class OfficeListener:
         self._seen_order: list = []
         self._stop = asyncio.Event()
         self._device_refreshed_at: float = 0.0
+        self._otk_checked_at: float = 0.0
+        # Se pone a True en _login() cuando el HS no tiene claves de NUESTRO
+        # device pero el store local si: hay que volver a subirlas sin tocar
+        # la identidad (ver _upload_keys).
+        self._force_reupload: bool = False
 
     # ---------------------------------------------------------------- ejecutor
     async def _dispatch(self, task: Task) -> TaskResult:
@@ -304,6 +323,7 @@ class OfficeListener:
     _ENV_KEYS: Dict[str, str] = {
         "NP_MX_DESKTOP_TOKEN": "token",
         "NP_MX_DESKTOP_PASSWORD": "password",
+        "NP_MX_DESKTOP_DEVICE_ID": "device_id",
         "NP_MX_OFFICE_ROOM_ID": "room_id",
         "NP_MX_OFFICE_ALIAS": "room_alias",
     }
@@ -340,6 +360,11 @@ class OfficeListener:
                 if only_if_changed:
                     setattr(cfg, attr, value)
                 changed.append(env_key)
+        # Que el env DECLARE device_id cambia el significado del valor: es la
+        # senal de que el deploy roto la identidad (credenciales nuevas) y no
+        # una simple relectura de token.
+        if fresh.get("NP_MX_DESKTOP_DEVICE_ID"):
+            cfg.device_id_from_env = True
         if changed:
             log("CREDENTIALS_RELOADED", source=str(path), vars=",".join(changed))
             # Credencial nueva = deploy nuevo: la sala y el estado de union
@@ -418,6 +443,135 @@ class OfficeListener:
             except OSError:
                 pass
         log("E2EE_STORE_RESET", reason=reason, removed=removed)
+
+    # ------------------------------------------------ salud de OTKs (E2EE)
+    async def _otk_count(self) -> Optional[int]:
+        """One-time keys que el homeserver conserva para NUESTRO device.
+
+        `POST keys/upload` con cuerpo vacio devuelve los contadores del
+        servidor sin subir nada: es la unica forma (sin admin API) de saber
+        desde el cliente cuantas OTKs quedan vivas ahi fuera.
+        """
+        import aiohttp
+
+        cfg = self.config
+        if not cfg.token:
+            return None
+        url = f"{cfg.homeserver}/_matrix/client/v3/keys/upload"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json={},
+                    headers={"Authorization": f"Bearer {cfg.token}"},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        counts = data.get("one_time_key_counts") or {}
+        try:
+            return int(counts.get("signed_curve25519")
+                       or counts.get("curve25519") or 0)
+        except (TypeError, ValueError):
+            return None
+
+    async def _drain_own_otk(self) -> int:
+        """Vacia en el HS nuestras OTKs cuyos ids ya quedaron huerfanos.
+
+        Solo se usa cuando la subida choca (400 "already exists"). Sin esto,
+        la unica cura seria purgar la BD del homeserver a mano tras CADA
+        deploy; Synapse permite autorreclamar con el propio token, asi que el
+        cliente se sana solo.
+        """
+        import aiohttp
+
+        cfg = self.config
+        if not cfg.token:
+            return 0
+        url = f"{cfg.homeserver}/_matrix/client/v3/keys/claim"
+        payload = {"one_time_keys": {cfg.mxid: {
+            cfg.device_id: "signed_curve25519"}}}
+        headers = {"Authorization": f"Bearer {cfg.token}"}
+        drained = 0
+        try:
+            async with aiohttp.ClientSession() as session:
+                for i in range(self.DRAIN_MAX):
+                    async with session.post(
+                        url, json=payload, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        if resp.status != 200:
+                            log("E2EE_OTK_DRAIN_STOP", status=resp.status,
+                                drained=drained)
+                            return drained
+                        data = await resp.json(content_type=None)
+                    keys = (((data or {}).get("one_time_keys") or {})
+                            .get(cfg.mxid) or {})
+                    if not keys:
+                        break
+                    drained += 1
+                    if i and i % 25 == 0:
+                        await asyncio.sleep(0.05)
+        except Exception as exc:
+            log("E2EE_OTK_DRAIN_FAIL", exc_type=type(exc).__name__,
+                exc=str(exc)[:120], drained=drained)
+            return drained
+        if drained:
+            log("E2EE_OTK_DRAINED", count=drained, device_id=cfg.device_id)
+        return drained
+
+    async def _upload_keys(self, force: bool = False) -> bool:
+        """Sube device_keys/OTK y registra el resultado REAL de la subida.
+
+        nio NO lanza excepcion cuando el homeserver rechaza la subida: devuelve
+        un KeysUploadError. Antes eso se logueaba como E2EE_KEYS_UPLOAD_OK y el
+        listener seguia "vivo" sin OTKs (sala E2EE muda, indetectable).
+
+        Si el HS rechaza por ids ya existentes se drenan autorreclamandolas y se
+        reintenta; cada intento ademas avanca 50 ids, asi que aun sin drenaje
+        acaba pasando. La cuenta local NUNCA se regenera aqui.
+        """
+        client = self.client
+        olm = getattr(client, "olm", None) if client else None
+        if client is None or olm is None or getattr(olm, "account", None) is None:
+            return False
+        if force:
+            olm.account.shared = False
+
+        try:
+            for attempt in range(1, self.UPLOAD_RETRIES + 1):
+                if force or client.should_upload_keys:
+                    resp = await client.keys_upload()
+                else:
+                    log("E2EE_KEYS_ALREADY_PUBLISHED",
+                        device_id=self.config.device_id,
+                        otk_count=await self._otk_count())
+                    return True
+                if not type(resp).__name__.endswith("Error"):
+                    log("E2EE_KEYS_UPLOAD_OK", device_id=self.config.device_id,
+                        attempt=attempt, force=bool(force))
+                    return True
+                detail = str(getattr(resp, "message", resp))[:200]
+                if "already exists" in detail.lower():
+                    log("E2EE_OTK_CONFLICT", attempt=attempt, detail=detail)
+                    await self._drain_own_otk()
+                    olm.account.shared = False
+                    continue
+                log("E2EE_KEYS_UPLOAD_FAIL", device_id=self.config.device_id,
+                    attempt=attempt, errcode=getattr(resp, "errcode", None),
+                    detail=detail)
+                return False
+        except Exception as exc:
+            log("E2EE_KEYS_UPLOAD_FAIL", device_id=self.config.device_id,
+                exc_type=type(exc).__name__, exc=str(exc)[:200])
+            return False
+        log("E2EE_KEYS_UPLOAD_FAIL", device_id=self.config.device_id,
+            retries=self.UPLOAD_RETRIES, detail="OTK_CONFLICT_PERSISTENTE")
+        return False
 
     async def _drop_client(self) -> None:
         """Suelta la sesion para que el proximo ciclo reloguee y revalide."""
@@ -500,9 +654,30 @@ class OfficeListener:
             log("AUTH_OK", device_id=cfg.device_id, detail=detail)
 
         store = Path(cfg.state_dir)
+        dev_file = store / "device_id.txt"
+        stored_dev = dev_file.read_text().strip() if dev_file.is_file() else ""
+
+        # 2) Rotacion de credenciales: el device_id que declara el env del
+        #    deploy MANDA sobre el del disco. El store solo se resetea cuando
+        #    cambia la IDENTIDAD. Regenerar la cuenta Olm del MISMO device
+        #    hace que sus ids de OTK vuelvan a empezar y choquen en el HS con
+        #    las filas viejas (400 "already exists"): la sala queda E2EE muda
+        #    y la unica cura manual seria purgar la BD del homeserver. Con el
+        #    top-up y el drenaje de _upload_keys eso ya no hace falta.
+        if cfg.device_id_from_env and stored_dev and cfg.device_id != stored_dev:
+            log("DEVICE_ID_ROTATED", old=stored_dev, new=cfg.device_id,
+                reason="credenciales_nuevas_del_deploy")
+            self._reset_olm_store("device_id_rotado_deploy")
+            stored_dev = ""
+        if not stored_dev and cfg.device_id:
+            dev_file.write_text(cfg.device_id)
+        elif not cfg.device_id_from_env and stored_dev:
+            # sin device_id en el env: se conserva la identidad del disco
+            cfg.device_id = stored_dev
+
         had_store = store.is_dir() and any(p.suffix == ".db" for p in store.glob("*"))
 
-        # 2) Comprobacion REAL de si el homeserver tiene publicadas las claves
+        # 3) Comprobacion REAL de si el homeserver tiene publicadas las claves
         #    de NUESTRO device, y ANTES de abrir el cliente: un store heredado
         #    de un deploy anterior hace que nio diga "already published" y
         #    nunca vuelva a subirlas -> nadie puede cifrarnos nada (la sala
@@ -517,8 +692,13 @@ class OfficeListener:
             log("DEVICE_KEYS_PROBE", device_id=cfg.device_id,
                 published=bool(own_keys))
             if devices is not None and not own_keys:
-                self._reset_olm_store("hs_sin_claves_del_device")
-                had_store = False
+                # Mismo device sin claves en el HS: se re-sube la MISMA cuenta
+                # local (shared=0) sin regenerar identidad. Los ids de OTK
+                # siguen avanzando desde donde estaban, asi que no hay
+                # colision con las filas que el HS conserve.
+                self._force_reupload = True
+                log("E2EE_FORCE_REUPLOAD", reason="hs_sin_claves_del_device",
+                    device_id=cfg.device_id)
         elif had_store and not cfg.token:
             # login por password con store heredado: nio creeria que las claves
             # siguen publicadas y no subiria las del device recien creado.
@@ -552,11 +732,17 @@ class OfficeListener:
 
         log("E2EE_OLM_READY", device_id=cfg.device_id, store_path=cfg.state_dir)
         try:
-            if client.should_upload_keys:
-                await client.keys_upload()
-                log("E2EE_KEYS_UPLOAD_OK", device_id=cfg.device_id)
-            else:
-                log("E2EE_KEYS_ALREADY_PUBLISHED", device_id=cfg.device_id)
+            # Sonda de OTKs en el HS antes de decidir: si hay menos de OTK_MIN
+            # se fuerza la re-subida con la MISMA cuenta (los ids siguen
+            # avanzando, sin colision con las filas que el HS conserve).
+            count = await self._otk_count()
+            force = self._force_reupload
+            self._force_reupload = False
+            if count is not None and count < self.OTK_MIN:
+                log("E2EE_OTK_TOPUP", hs_count=count, min=self.OTK_MIN,
+                    where="setup")
+                force = True
+            await self._upload_keys(force=force)
             if client.should_query_keys:
                 await client.keys_query()
                 log("E2EE_KEYS_QUERY_OK", reason="startup")
@@ -820,8 +1006,22 @@ class OfficeListener:
             if self.client.should_query_keys:
                 await self.client.keys_query()
                 log("E2EE_KEYS_QUERY_OK", reason="maintenance")
-            if self.client.should_upload_keys:
-                await self.client.keys_upload()
+            # Salud de las OTKs (E2EE-OTK-SELFHEAL-01): nio solo sube cuando
+            # su propio contador dice que falta; si el HS se queda sin OTKs
+            # (las fueron agotando otros clientes) nadie puede abrir sesion
+            # Olm con nosotros y las tareas dejan de llegarnos. Sondeo periodico
+            # + re-subida con la misma cuenta si el HS esta por debajo del min.
+            topup = False
+            if time.time() - self._otk_checked_at >= self.OTK_CHECK_SECS:
+                self._otk_checked_at = time.time()
+                count = await self._otk_count()
+                if count is not None and count < self.OTK_MIN:
+                    log("E2EE_OTK_TOPUP", hs_count=count, min=self.OTK_MIN,
+                        where="maintenance")
+                    await self._upload_keys(force=True)
+                    topup = True
+            if not topup and self.client.should_upload_keys:
+                await self._upload_keys()
             if self.client.should_claim_keys:
                 await self.client.keys_claim(
                     self.client.get_users_for_key_claiming())
