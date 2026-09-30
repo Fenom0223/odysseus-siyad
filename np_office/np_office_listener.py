@@ -53,6 +53,23 @@ VARIABLES DE ENTORNO (las escribe onboard.sh en el docker.env del usuario)
     NP_OFFICE_SYNC_TIMEOUT    (opcional) ms de long-poll. default: 30000
     NP_MX_TRUSTED_SENDERS     (opcional) CSV de remitentes extra confiables
     NP_OFFICE_ENCRYPTED       (opcional) 1 = exigir E2EE (falla si falta olm)
+    NP_OFFICE_ENV_FILE        (opcional) ruta del env que entrego el deploy:
+                               si las credenciales caducan se relee y se
+                               reconecta solo (sin reiniciar el proceso).
+
+DINAMICA (multi-inquilino: un deploy/empleado por app, nada del pasado)
+    1. Las credenciales se VALIDAN contra el homeserver (whoami) antes de
+       confiar en ellas; un token de un deploy anterior dispara
+       CREDENTIALS_STALE, releer NP_OFFICE_ENV_FILE y reintentar con backoff
+       en lugar de quedarse "conectado" a la nada.
+    2. El store Olm local solo se usa si el homeserver CONFIRMA que nuestro
+       device tiene claves publicadas. Si el HS es de otro deploy (device
+       recien creado, sin claves), nio diria "already published" y nunca
+       volveria a subirlas -> sala E2EE muda para siempre. En ese caso se
+       regenera la cuenta Olm (E2EE_STORE_RESET) y se publican claves nuevas.
+    3. La sala se resuelve SIEMPRE por alias (estable por usuario/deploy);
+       el room_id del env solo se usa si no hay alias configurado. Un
+       room_id heredado de un deploy anterior no puede secuestrar la sala.
 
 E2EE
     Requiere matrix-nio[e2e] (libolm). El device_id DEBE ser fijo y el store
@@ -69,21 +86,27 @@ import asyncio
 import io
 import json
 import os
+import shutil
 import signal
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 try:
     from nio import (
         AsyncClient,
         AsyncClientConfig,
+        LoginError,
         LoginResponse,
         MegolmEvent,
         RoomMessageText,
+        SyncError,
+        SyncResponse,
         UploadResponse,
+        WhoamiError,
+        WhoamiResponse,
     )
 except ImportError:  # pragma: no cover
     print("[OFFICE] FATAL: falta matrix-nio. Instalar: pip install 'matrix-nio[e2e]'",
@@ -147,6 +170,7 @@ class OfficeConfig:
     sync_timeout: int = 30000
     backoff_start: float = 2.0
     backoff_max: float = 60.0
+    env_file: str = ""
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None) -> "OfficeConfig":
@@ -165,6 +189,7 @@ class OfficeConfig:
         bot_mxid = _get("NP_MX_BOT_MXID")
         task_url = _get("NP_OFFICE_TASK_URL")
         state_dir = _get("NP_OFFICE_STATE_DIR", "./.np_office") or "./.np_office"
+        env_file = _get("NP_OFFICE_ENV_FILE")
         encrypted = _truthy(_get("NP_OFFICE_ENCRYPTED"))
         extra = [s.strip() for s in _get("NP_MX_TRUSTED_SENDERS").split(",") if s.strip()]
         trusted = tuple(dict.fromkeys([x for x in ([bot_mxid] + extra) if x]))
@@ -204,6 +229,7 @@ class OfficeConfig:
             trusted=trusted,
             encrypted=encrypted,
             sync_timeout=sync_timeout,
+            env_file=env_file,
         )
 
 
@@ -220,7 +246,9 @@ class OfficeListener:
         self.config = config or OfficeConfig.from_env()
         self.handler = handler
         self.client: Optional[AsyncClient] = None
-        self._room_id: Optional[str] = self.config.room_id or None
+        # La sala se resuelve por ALIAS en cada arranque: un room_id heredado
+        # de un deploy anterior no debe usarse (ver _resolve_room).
+        self._room_id: Optional[str] = None
         self._seen: set = set()
         self._joined: set = set()
         self._seen_order: list = []
@@ -272,7 +300,137 @@ class OfficeListener:
         return TaskResult(text=str(data))
 
     # ------------------------------------------------------------------ matrix
-    async def _login(self) -> None:
+    # ------------------------------------------------------- credenciales vivas
+    _ENV_KEYS: Dict[str, str] = {
+        "NP_MX_DESKTOP_TOKEN": "token",
+        "NP_MX_DESKTOP_PASSWORD": "password",
+        "NP_MX_OFFICE_ROOM_ID": "room_id",
+        "NP_MX_OFFICE_ALIAS": "room_alias",
+    }
+
+    def _reload_env_file(self, only_if_changed: bool = True) -> bool:
+        """Relee el env que entrego el deploy. True si cambio algo relevante.
+
+        Es el camino de reconexion multi-inquilino: cada empleado/cliente
+        recibe SU env en SU deploy; si el proceso sigue vivo cuando esas
+        credenciales caducan, se recargan en caliente y no hace falta
+        reiniciar nada a mano.
+        """
+        cfg = self.config
+        path = Path(cfg.env_file) if cfg.env_file else None
+        if path is None or not path.is_file():
+            return False
+        try:
+            raw = path.read_text()
+        except OSError:
+            return False
+
+        fresh: Dict[str, str] = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            fresh[key.strip()] = value.strip().strip('"').strip("'")
+
+        changed = []
+        for env_key, attr in self._ENV_KEYS.items():
+            value = fresh.get(env_key, "")
+            if value and value != getattr(cfg, attr):
+                if only_if_changed:
+                    setattr(cfg, attr, value)
+                changed.append(env_key)
+        if changed:
+            log("CREDENTIALS_RELOADED", source=str(path), vars=",".join(changed))
+            # Credencial nueva = deploy nuevo: la sala y el estado de union
+            # tambien pueden haber cambiado.
+            self._room_id = None
+            self._joined.clear()
+            self._device_refreshed_at = 0.0
+        return bool(changed)
+
+    async def _whoami(self) -> Tuple[bool, str]:
+        """Valida el token contra el homeserver. (False, motivo) = caducado."""
+        import aiohttp
+
+        cfg = self.config
+        if not cfg.token:
+            return False, "sin_token"
+        url = f"{cfg.homeserver}/_matrix/client/v3/account/whoami"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers={"Authorization": f"Bearer {cfg.token}"},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    status = resp.status
+                    data = await resp.json(content_type=None)
+        except Exception as exc:
+            # Red/HS caido: no hay informacion para declarar caducado.
+            log("AUTH_PROBE_FAIL", exc_type=type(exc).__name__, exc=str(exc)[:160])
+            return True, "probe_inaccesible"
+        if status == 401 or (isinstance(data, dict) and data.get("errcode")):
+            return False, str((data or {}).get("errcode") or f"http_{status}")
+        return True, "ok"
+
+    async def _server_device_keys(self, access_token: str) -> Optional[Dict[str, Any]]:
+        """Claves de NUESTRO device en el homeserver. None = no se pudo ver."""
+        import aiohttp
+
+        cfg = self.config
+        url = f"{cfg.homeserver}/_matrix/client/v3/keys/query"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json={"device_keys": {cfg.mxid: []}},
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+        except Exception as exc:
+            log("DEVICE_KEYS_PROBE_FAIL", exc_type=type(exc).__name__,
+                exc=str(exc)[:160])
+            return None
+        if not isinstance(data, dict):
+            return None
+        devices = data.get("device_keys", {}).get(cfg.mxid, {}) or {}
+        return dict(devices)
+
+    def _reset_olm_store(self, reason: str) -> None:
+        """Regenera la cuenta Olm local (el device del HS no tiene claves)."""
+        store = Path(self.config.state_dir)
+        if not store.is_dir():
+            return
+        removed = 0
+        for path in store.glob("*"):
+            if path.name == "device_id.txt":
+                continue  # el device_id es del deploy y no cambia
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink()
+                removed += 1
+            except OSError:
+                pass
+        log("E2EE_STORE_RESET", reason=reason, removed=removed)
+
+    async def _drop_client(self) -> None:
+        """Suelta la sesion para que el proximo ciclo reloguee y revalide."""
+        client, self.client = self.client, None
+        self._room_id = None
+        self._joined.clear()
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    async def _build_client(self) -> AsyncClient:
         cfg = self.config
         store = Path(cfg.state_dir)
         store.mkdir(parents=True, exist_ok=True)
@@ -302,7 +460,6 @@ class OfficeListener:
 
         if cfg.token:
             client.restore_login(cfg.mxid, cfg.device_id, cfg.token)
-            log("LOGIN_TOKEN", mxid=cfg.mxid, device_id=cfg.device_id)
         else:
             # nio 0.25.x: login() NO acepta device_id (la firma es
             # password/device_name/token). El device_id FIJO va en el
@@ -311,11 +468,67 @@ class OfficeListener:
                 cfg.password, device_name=cfg.device_name,
             )
             if not isinstance(resp, LoginResponse):
+                await client.close()
                 raise RuntimeError(f"login fallo: {resp}")
+            cfg.token = getattr(resp, "access_token", "") or cfg.token
             log("LOGIN_PASSWORD", mxid=cfg.mxid,
                 device=getattr(resp, "device_id", "?"))
+        return client
 
+    async def _login(self) -> None:
+        cfg = self.config
+
+        # 0) Credenciales vivas: el env del deploy manda sobre el estado
+        #    guardado en memoria de un ciclo anterior.
+        if cfg.env_file:
+            self._reload_env_file()
+
+        # 1) El token se valida ANTES de confiar en el: un token de un deploy
+        #    anterior (401) no debe dejar el listener "corriendo" en vano.
+        if cfg.token:
+            ok, detail = await self._whoami()
+            if not ok:
+                log("CREDENTIALS_STALE", detail=detail,
+                    env_file=cfg.env_file or "-")
+                if self._reload_env_file():
+                    ok, detail = await self._whoami()
+                if not ok:
+                    raise RuntimeError(
+                        f"CREDENTIALS_STALE ({detail}): sin token valido; "
+                        "esperando credenciales nuevas del deploy"
+                    )
+            log("AUTH_OK", device_id=cfg.device_id, detail=detail)
+
+        store = Path(cfg.state_dir)
+        had_store = store.is_dir() and any(p.suffix == ".db" for p in store.glob("*"))
+
+        # 2) Comprobacion REAL de si el homeserver tiene publicadas las claves
+        #    de NUESTRO device, y ANTES de abrir el cliente: un store heredado
+        #    de un deploy anterior hace que nio diga "already published" y
+        #    nunca vuelva a subirlas -> nadie puede cifrarnos nada (la sala
+        #    queda E2EE muda para siempre). Se consulta por HTTP plano para no
+        #    dejar un cliente sqlite abierto por el camino (borrar el store con
+        #    el cliente vivo tira "attempt to write a readonly database").
+        if cfg.token and had_store:
+            devices = await self._server_device_keys(cfg.token)
+            # OJO: keys/query con la lista vacia devuelve TODOS los devices del
+            # usuario, asi que hay que mirar SIEMPRE el nuestro.
+            own_keys = (devices or {}).get(cfg.device_id)
+            log("DEVICE_KEYS_PROBE", device_id=cfg.device_id,
+                published=bool(own_keys))
+            if devices is not None and not own_keys:
+                self._reset_olm_store("hs_sin_claves_del_device")
+                had_store = False
+        elif had_store and not cfg.token:
+            # login por password con store heredado: nio creeria que las claves
+            # siguen publicadas y no subiria las del device recien creado.
+            self._reset_olm_store("login_password_store_heredado")
+            had_store = False
+
+        client = await self._build_client()
         self.client = client
+        log("LOGIN_TOKEN", mxid=cfg.mxid, device_id=cfg.device_id,
+            store_reused=bool(had_store))
         await self._setup_e2ee()
 
     async def _setup_e2ee(self) -> None:
@@ -355,18 +568,51 @@ class OfficeListener:
             event_id=getattr(event, "event_id", "?"),
             sender=getattr(event, "sender", "?"))
 
-    async def _resolve_room(self) -> str:
-        if self._room_id:
-            return self._room_id
+    async def _resolve_room(self, strict: bool = True) -> str:
+        """Resuelve la sala de la oficina; el ALIAS es la fuente de verdad.
+
+        El alias (#my-office-<app>-<usuario>) lo crea onboard.sh por usuario y
+        es estable entre deploys, mientras que el room_id del env pertenece a
+        UN deploy concreto: reutilizarlo tras un re-deploy mandaria las tareas
+        a una sala que ya nadie escucha. Por eso:
+
+          * con alias configurado -> se resuelve SIEMPRE el alias y si no
+            resuelve se reintenta en el proximo ciclo (nunca room_id viejo);
+          * sin alias -> se usa el room_id del env (implantaciones legacy).
+
+        Si el alias deja de resolver en caliente (sala recreada por otro
+        proceso), el cache se invalida y se vuelve a resolver.
+        """
+        cfg = self.config
         if self.client is None:
             raise RuntimeError("cliente no inicializado")
-        resp = await self.client.room_resolve_alias(self.config.room_alias)
+
+        if not cfg.room_alias:
+            if not self._room_id and cfg.room_id:
+                self._room_id = cfg.room_id
+                log("ROOM_FROM_ENV", room_id=cfg.room_id)
+            if not self._room_id:
+                raise RuntimeError("no hay NP_MX_OFFICE_ALIAS ni NP_MX_OFFICE_ROOM_ID")
+            return self._room_id
+
+        resp = await self.client.room_resolve_alias(cfg.room_alias)
         room_id = getattr(resp, "room_id", None)
-        if not room_id:
-            raise RuntimeError(f"no pude resolver la sala {self.config.room_alias}: {resp}")
-        self._room_id = room_id
-        log("ROOM_RESOLVED", alias=self.config.room_alias, room_id=room_id)
-        return room_id
+        if room_id:
+            if room_id != self._room_id:
+                self._room_id = room_id
+                log("ROOM_RESOLVED", alias=cfg.room_alias, room_id=room_id)
+            return room_id
+        detail = str(getattr(resp, "message", resp))[:160]
+        if self._room_id:
+            # el alias dejo de resolver con la sala cacheada: se invalida, pero
+            # si el caller no es estricto (enviar un resultado) se usa la sala
+            # conocida en lugar de perder la respuesta del usuario.
+            log("ROOM_ALIAS_RECHECK_FAIL", alias=cfg.room_alias, detail=detail)
+            if not strict:
+                return self._room_id
+            self._room_id = None
+            self._joined.clear()
+        raise RuntimeError(f"no pude resolver la sala {cfg.room_alias}: {detail}")
 
     # ------------------------------------------------------------------ eventos
     def _accept(self, event: Any) -> bool:
@@ -456,7 +702,9 @@ class OfficeListener:
     async def _post_result(self, result: TaskResult) -> None:
         if self.client is None:
             raise RuntimeError("cliente no inicializado")
-        room_id = await self._resolve_room()
+        # strict=False: si el alias falla en este instante se usa la sala ya
+        # conocida; se prefiere entregar el resultado antes que perderlo.
+        room_id = await self._resolve_room(strict=False)
         text = (result.text or "").strip() or "Tarea completada."
 
         # Device list fresca justo antes de compartir la session megolm
@@ -592,18 +840,38 @@ class OfficeListener:
         cfg = self.config
         executor = "handler" if self.handler else ("http" if cfg.task_url else "none")
         log("BOOT", mxid=cfg.mxid, homeserver=cfg.homeserver,
-            room=(cfg.room_id or cfg.room_alias), executor=executor,
+            room=(cfg.room_alias or cfg.room_id), executor=executor,
             device_id=cfg.device_id, device_name=cfg.device_name, e2ee=cfg.encrypted,
-            trusted=",".join(cfg.trusted))
+            trusted=",".join(cfg.trusted), env_file=cfg.env_file or "-")
 
         backoff = cfg.backoff_start
+        last_env_check = 0.0
         while not self._stop.is_set():
             try:
+                # El env del deploy manda mientras el proceso viva: si el
+                # deploy escribe credenciales nuevas (rotacion diaria, otro
+                # empleado/cliente), se cambia de sesion sin reiniciar nada.
+                if cfg.env_file and time.time() - last_env_check >= 60:
+                    last_env_check = time.time()
+                    if self._reload_env_file() and self.client is not None:
+                        log("SESSION_RESET", reason="credenciales_nuevas_del_deploy")
+                        await self._safe_close()
+                        continue
+
                 if self.client is None:
                     await self._login()
                 await self._resolve_room()
                 await self._ensure_joined()
-                await self.client.sync(timeout=cfg.sync_timeout)
+                resp = await self.client.sync(timeout=cfg.sync_timeout)
+                if isinstance(resp, SyncError):
+                    status = getattr(resp, "status_code", None)
+                    detail = str(getattr(resp, "message", resp))[:200]
+                    if status in (401, 403) or "M_UNKNOWN_TOKEN" in detail:
+                        # token caducado/revocado: se cierra y en el proximo
+                        # ciclo _login() revalida y relee el env del deploy.
+                        log("CREDENTIALS_STALE", detail=f"http_{status}",
+                            env_file=cfg.env_file or "-")
+                    raise RuntimeError(f"sync fallo ({status}): {detail}")
                 await self._key_maintenance()
                 backoff = cfg.backoff_start
             except asyncio.CancelledError:
@@ -638,12 +906,15 @@ def selfcheck(config: OfficeConfig) -> int:
     print(f"  mxid       : {config.mxid}")
     print(f"  auth       : {'token' if config.token else 'password'}")
     print(f"  device_id  : {config.device_id}")
-    print(f"  room       : {config.room_id or config.room_alias}")
+    print(f"  room       : {config.room_alias or config.room_id}")
+    if config.room_alias and config.room_id:
+        print(f"  room_id    : {config.room_id} (solo fallback; el alias manda)")
     print(f"  e2ee       : {'requerido' if config.encrypted else 'opcional/no exigido'}")
     print(f"  confiables : {', '.join(config.trusted)}")
     print(f"  ejecutor   : {config.task_url or 'handler Python (solo via API)'}")
     print(f"  device_name: {config.device_name}")
     print(f"  state_dir  : {config.state_dir}")
+    print(f"  env_file   : {config.env_file or '(no relee credenciales en caliente)'}")
     print(f"  sync       : {config.sync_timeout} ms")
     return 0
 
