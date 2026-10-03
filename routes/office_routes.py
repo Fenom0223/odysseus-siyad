@@ -49,6 +49,12 @@ def _resolve_endpoint():
     requires an API key" (_tasks_ que el listener registraba como TASK_DONE,
     o sea un fallo silencioso en la sala).
     """
+    # OFFICE-LLM-401-02 (3-oct-2026): key vigente de LiteLLM en cada llamada;
+    # el .env sólo se lee al arrancar y un re/deploy que rota la master key
+    # dejaba esta ruta en 401 silencioso (mismo síntoma que FIX OFFICE-LLM-ENV-01).
+    from np_llm_creds import ensure as _ensure_llm_creds
+    _ensure_llm_creds()
+
     env_url = (os.environ.get("NP_OFFICE_LLM_URL") or "").strip().rstrip("/")
     env_model = (os.environ.get("NP_OFFICE_LLM_MODEL") or "").strip()
     env_key = (os.environ.get("NP_OFFICE_LLM_KEY") or "").strip()
