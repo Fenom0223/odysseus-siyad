@@ -801,16 +801,29 @@ class OfficeListener:
         raise RuntimeError(f"no pude resolver la sala {cfg.room_alias}: {detail}")
 
     # ------------------------------------------------------------------ eventos
-    def _accept(self, event: Any) -> bool:
+    def _accept(self, event: Any, room: Any = None) -> bool:
         cfg = self.config
         if event.sender == cfg.mxid:
             return False
         if cfg.trusted and event.sender not in cfg.trusted:
             log("TASK_REJECTED_SENDER", sender=event.sender)
             return False
-        if self._room_id and getattr(event, "room_id", None) != self._room_id:
-            return False
         if not (event.body or "").lstrip().startswith(TASK_MARKER):
+            return False
+        # OFFICE-SORDOS-01: matrix-nio 0.25.x NO pobla room_id en
+        # RoomMessageText (si lo hace en MegolmEvent). El gate leia
+        # event.room_id -> None != room_id -> descartaba TODO el trafico en
+        # silencio, porque el bucle resuelve la sala (fija self._room_id) ANTES
+        # de cada sync. El room real viene como argumento del callback.
+        # Solo se compara cuando se puede determinar; sin room no se acepta.
+        event_room = getattr(event, "room_id", None) or getattr(
+            room, "room_id", None
+        )
+        if not event_room:
+            log("TASK_REJECTED_ROOM", room="desconocido")
+            return False
+        if self._room_id and event_room != self._room_id:
+            log("TASK_REJECTED_ROOM", room=event_room)
             return False
         if getattr(event, "event_id", "") in self._seen:
             return False
@@ -856,7 +869,7 @@ class OfficeListener:
 
     async def _on_message(self, room: Any, event: Any) -> None:
         try:
-            if not self._accept(event):
+            if not self._accept(event, room):
                 return
             self._remember(event.event_id)
 
