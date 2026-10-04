@@ -82,6 +82,59 @@ _SQL_INTENTS = (
              "WHERE exception_detail <> '' ORDER BY cost_aed DESC"),
         ),
     ),
+    (
+        re.compile(
+            r"contract|contrato|rate|tarifa|margin|margen|quote|cotizaci|"
+            r"rfq|benchmark|pricing", re.I),
+        ("contracts_and_rates",),
+        (
+            ("rates contratados por ruta/equipo",
+             "SELECT contract_id, customer, route, equipment_type, "
+             "CAST(contracted_rate_aed AS REAL) AS rate_aed, "
+             "CAST(min_margin_pct AS REAL) AS min_margin_pct, valid_to "
+             "FROM contracts_and_rates ORDER BY rate_aed DESC"),
+            ("condiciones comerciales",
+             "SELECT contract_id, customer, route, payment_terms_days, "
+             "valid_from, valid_to FROM contracts_and_rates "
+             "ORDER BY customer"),
+        ),
+    ),
+    (
+        re.compile(
+            r"dnd|demurrage|detention|free[ -]?time|contenedor|container", re.I),
+        ("dnd_exposure", "erp_shipments"),
+        (
+            ("exposicion D&D por contenedor (dias restantes y coste/dia)",
+             "SELECT container, shipment, "
+             "CAST(demurrage_usd_day AS REAL) AS demurrage_day, "
+             "CAST(detention_usd_day AS REAL) AS detention_day, "
+             "ROUND(CAST(demurrage_usd_day AS REAL) + "
+             "CAST(detention_usd_day AS REAL), 2) AS combined_day, "
+             "free_time_expiry, "
+             "CAST(julianday(free_time_expiry) - julianday('now')) "
+             "AS days_free_left, status FROM dnd_exposure "
+             "ORDER BY days_free_left"),
+            ("free time y coste/dia en erp_shipments",
+             "SELECT shipment_id, container_no, customer, status, "
+             "free_time_expiry, CAST(dnd_usd_per_day AS REAL) AS dnd_usd_day "
+             "FROM erp_shipments ORDER BY free_time_expiry"),
+        ),
+    ),
+    (
+        re.compile(
+            r"compliance|lesson|lecci|inspecci|inspection|watchlist|regla|"
+            r"rule|memoria|memory|amend|enmienda", re.I),
+        ("compliance_memory", "erp_shipments"),
+        (
+            ("memoria de compliance (reglas aprendidas)",
+             "SELECT rule_id, source_incident, added_date, rule_text "
+             "FROM compliance_memory ORDER BY added_date DESC"),
+            ("envios con incidencia aduanera/inspeccion",
+             "SELECT shipment_id, customer, carrier, status, exception_detail, "
+             "CAST(exception_cost_aed AS REAL) AS cost_aed FROM erp_shipments "
+             "WHERE exception_detail <> '' ORDER BY shipment_id"),
+        ),
+    ),
 )
 
 GROUNDING_RULE = (
